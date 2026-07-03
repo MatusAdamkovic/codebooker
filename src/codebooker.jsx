@@ -2,6 +2,7 @@ import React, { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
 import mammoth from "mammoth";
+import JSZip from "jszip";
 import {
   Upload, FileText, Table2, Sparkles, Download, RotateCcw,
   Trash2, Plus, X, BookOpen, ChevronDown, ChevronUp, FlaskConical
@@ -62,6 +63,59 @@ const truncate = (t, n) => {
   const c = stripMarkup(t);
   return c.length <= n ? c : c.slice(0, n - 1).trimEnd() + "…";
 };
+
+const decodeXmlEntities = (text) =>
+  String(text || "").replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (m, ent) => {
+    const lower = ent.toLowerCase();
+    if (lower === "amp") return "&";
+    if (lower === "lt") return "<";
+    if (lower === "gt") return ">";
+    if (lower === "quot") return '"';
+    if (lower === "apos") return "'";
+    const code = lower.startsWith("#x")
+      ? parseInt(lower.slice(2), 16)
+      : parseInt(lower.slice(1), 10);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+  });
+
+const looksBinary = (text) => {
+  const sample = String(text || "").slice(0, 2048);
+  if (!sample) return false;
+  if (sample.startsWith("PK\u0003\u0004")) return true;
+  let suspicious = 0;
+  for (const ch of sample) {
+    const code = ch.charCodeAt(0);
+    if ((code >= 0 && code < 9) || (code > 13 && code < 32) || code === 65533) suspicious++;
+  }
+  return suspicious / sample.length > 0.02;
+};
+
+async function extractDocxXmlText(arrayBuffer) {
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const documentXml = zip.file("word/document.xml");
+  if (!documentXml) return "";
+  const xml = await documentXml.async("string");
+  const paragraphs = [];
+  const paraRe = /<w:p\b[\s\S]*?<\/w:p>/g;
+  let paraMatch;
+  while ((paraMatch = paraRe.exec(xml))) {
+    const para = paraMatch[0];
+    const style = para.match(/<w:pStyle\b[^>]*w:val="([^"]+)"/)?.[1] || "";
+    const chunks = [];
+    const tokenRe = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:br\b[^>]*\/>/g;
+    let m;
+    while ((m = tokenRe.exec(para))) {
+      chunks.push(m[1] !== undefined ? decodeXmlEntities(m[1]) : "\n");
+    }
+    const text = chunks.join("").replace(/[ \t]+\n/g, "\n").trim();
+    if (text) paragraphs.push(text);
+    else if (/QuestionSeparator|BlockSeparator/i.test(style)) paragraphs.push(style);
+  }
+  return paragraphs
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 const inferMeasurement = (values) => {
   const nonNull = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
@@ -343,19 +397,30 @@ function parseQualtricsText(name, text, includeWording) {
     const line = raw.replace(/\u2028/g, " ").replace(/\s+/g, " ").trim();
     if (!line) continue;
     const low = line.toLowerCase();
-    if (low.startsWith("start of block:") || low.startsWith("end of block:") || low.startsWith("koniec bloku:")) {
+    if (
+      low.startsWith("start of block:") ||
+      low.startsWith("end of block:") ||
+      low.startsWith("koniec bloku:") ||
+      low.includes("questionseparator") ||
+      low.includes("blockseparator") ||
+      low === "page break"
+    ) {
       flush();
       continue;
     }
 
     const coded = line.match(/(.+?)\s+\(([^)]+)\)\s*$/);
-    if (coded) {
+    if (currentId && coded) {
       const label = coded[1].replace(/•/g, "").trim();
       const code = coded[2].trim();
       const numeric = /^\d+$/.test(code) ? parseInt(code, 10) : null;
+      if (numeric === null) {
+        currentQuestion = `${currentQuestion} ${line}`.trim();
+        continue;
+      }
       const descendingIntoItems =
         optionCodes.length && numeric !== null && numeric <= Math.min(...optionCodes);
-      if (!descendingIntoItems && (line.startsWith("•") || looksLikeOptionLabel(label))) {
+      if (!descendingIntoItems && (line.startsWith("•") || looksLikeOptionLabel(label) || !options.length || optionCodes.length)) {
         options.push(`${code}=${label}`);
         if (numeric !== null) optionCodes.push(numeric);
         continue;
@@ -502,6 +567,9 @@ function mergeRows(rows) {
     }
 
     const variable =
+      surveyRows.find((r) => r.Variable.trim())?.Variable.trim() ||
+      dataRows.find((r) => r.Variable.trim())?.Variable.trim() ||
+      g.find((r) => r.Variable.trim())?.Variable.trim() ||
       firstSentence(description) ||
       (dataRows.length ? `${prettify(name)} observed in uploaded data` : prettify(name));
 
@@ -555,11 +623,18 @@ async function readUpload(file, roleOverride, includeWording) {
       }
     } else if (ext === "csv" || ext === "tsv") {
       const text = await readText();
-      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-      const headers = parsed.meta.fields || [];
-      role = role || "data";
-      rows = parseTable(file.name, headers, parsed.data);
-      summary = summarizeTable(file.name, headers, parsed.data);
+      if (looksBinary(text)) {
+        notes.push(
+          `${file.name}: this does not look like a plain-text ${ext.toUpperCase()} file. It appears to be binary or zipped; export it again as CSV or XLSX.`
+        );
+        role = role || "unknown";
+      } else {
+        const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+        const headers = parsed.meta.fields || [];
+        role = role || "data";
+        rows = parseTable(file.name, headers, parsed.data);
+        summary = summarizeTable(file.name, headers, parsed.data);
+      }
     } else if (ext === "xlsx" || ext === "xlsm" || ext === "xls") {
       const buf = await readBuffer();
       const wb = XLSX.read(buf, { type: "array" });
@@ -577,9 +652,16 @@ async function readUpload(file, roleOverride, includeWording) {
     } else if (ext === "docx") {
       const buf = await readBuffer();
       const result = await mammoth.extractRawText({ arrayBuffer: buf });
+      let text = result.value || "";
+      if (!stripMarkup(text)) {
+        text = await extractDocxXmlText(buf);
+      }
       role = role || "survey";
-      rows = parseSurveyText(file.name, result.value || "", includeWording);
-      summary = truncate(result.value || "", 6000);
+      rows = parseSurveyText(file.name, text, includeWording);
+      summary = truncate(text, 6000);
+      if (!rows.length) {
+        notes.push(`${file.name}: no survey variables were detected in the DOCX text; try exporting the survey as QSF or plain text.`);
+      }
     } else if (ext === "txt" || ext === "md") {
       const text = await readText();
       role = role || "survey";
@@ -685,7 +767,7 @@ function extractJSON(text) {
 
 const PROVIDERS = {
   builtin: {
-    label: "Built-in Claude (no key needed)",
+    label: "Built-in Claude (inside Claude only)",
     defaultModel: "claude-sonnet-4-6",
     models: ["claude-sonnet-4-6"],
     needsKey: false,
@@ -703,6 +785,9 @@ const PROVIDERS = {
     needsKey: true,
   },
 };
+
+const canUseBuiltInClaude = () =>
+  typeof window !== "undefined" && Boolean(window.claude);
 
 async function callModel({ provider, model, apiKey, system, userMsg }) {
   if (provider === "openai") {
@@ -745,16 +830,28 @@ async function callModel({ provider, model, apiKey, system, userMsg }) {
     headers["anthropic-version"] = "2023-06-01";
     headers["anthropic-dangerous-direct-browser-access"] = "true";
   }
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      max_tokens: provider === "builtin" ? 1000 : 4000,
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    }),
-  });
+  let resp;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        max_tokens: provider === "builtin" ? 1000 : 4000,
+        system,
+        messages: [{ role: "user", content: userMsg }],
+      }),
+    });
+  } catch {
+    if (provider === "builtin") {
+      throw new Error(
+        "The built-in keyless option only works when this app runs inside Claude. On localhost or GitHub Pages, switch the provider to Anthropic API or OpenAI API and enter your own key."
+      );
+    }
+    throw new Error(
+      "Could not reach the Anthropic API from this browser. Check your connection and API key, or try the OpenAI provider when running the app outside Claude."
+    );
+  }
   if (!resp.ok) {
     if (provider === "builtin") {
       throw new Error(
@@ -1130,8 +1227,10 @@ export default function Codebooker() {
   const [error, setError] = useState("");
   const [showMd, setShowMd] = useState(false);
   const [dragOver, setDragOver] = useState(false);
-  const [provider, setProvider] = useState("builtin");
-  const [model, setModel] = useState(PROVIDERS.builtin.defaultModel);
+  const [provider, setProvider] = useState(() => canUseBuiltInClaude() ? "builtin" : "anthropic");
+  const [model, setModel] = useState(() =>
+    canUseBuiltInClaude() ? PROVIDERS.builtin.defaultModel : PROVIDERS.anthropic.defaultModel
+  );
   const [apiKey, setApiKey] = useState("");
   const inputRef = useRef(null);
   const idRef = useRef(0);
@@ -1192,8 +1291,12 @@ export default function Codebooker() {
 
   const runAI = async () => {
     setError("");
+    if (provider === "builtin" && !canUseBuiltInClaude()) {
+      setError("The built-in Claude option only works when this app runs inside Claude. On localhost or GitHub Pages, choose Anthropic API or OpenAI API and enter your own key.");
+      return;
+    }
     if (PROVIDERS[provider].needsKey && !apiKey.trim()) {
-      setError(`Enter your ${provider === "openai" ? "OpenAI" : "Anthropic"} API key in AI settings first, or switch to the built-in provider.`);
+      setError(`Enter your ${provider === "openai" ? "OpenAI" : "Anthropic"} API key in AI settings first.`);
       return;
     }
     setBusy("Preparing refinement…");
@@ -1250,8 +1353,9 @@ export default function Codebooker() {
       <p className="cbk-tagline">
         Turn a survey export into a <strong>SCORE-style codebook</strong>. A deterministic
         draft is built first, entirely in your browser; an AI model can then refine wording
-        and structure — with the built-in Claude option, <strong>no API key is needed</strong>.
-        Or plug in your own Anthropic or OpenAI key and pick a model. Review, edit, export.
+        and structure. Inside Claude, the built-in option needs <strong>no API key</strong>;
+        on a standalone site, plug in your own Anthropic or OpenAI key and pick a model.
+        Review, edit, export.
       </p>
 
       <div className="cbk-steps" aria-label="Workflow">
@@ -1378,7 +1482,9 @@ export default function Codebooker() {
             )}
             <div className="cbk-ai-hint">
               {provider === "builtin"
-                ? "Runs on Claude with no key or cost — available while this app is used inside Claude."
+                ? canUseBuiltInClaude()
+                  ? "Runs on Claude with no key or cost while this app is used inside Claude."
+                  : "Built-in Claude is unavailable on localhost or GitHub Pages. Choose Anthropic API or OpenAI API and enter your own key."
                 : provider === "anthropic"
                 ? "Your key is kept in memory only and sent directly to Anthropic from your browser."
                 : "Your key is kept in memory only and sent directly to OpenAI. Inside claude.ai this call is blocked by browser security rules; it works when the app is hosted standalone."}
