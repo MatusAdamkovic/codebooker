@@ -1074,23 +1074,42 @@ function extractJSON(text) {
 const PROVIDERS = {
   builtin: {
     label: "Built-in Claude (inside Claude only)",
-    defaultModel: "claude-sonnet-4-6",
-    models: ["claude-sonnet-4-6"],
+    defaultModel: "claude-sonnet-5",
+    models: [
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+    ],
     needsKey: false,
   },
   anthropic: {
     label: "Anthropic API (your key)",
-    defaultModel: "claude-sonnet-4-6",
-    models: ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-8"],
+    defaultModel: "claude-sonnet-5",
+    models: [
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+      { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+      { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+      { id: "claude-fable-5", label: "Claude Fable 5" },
+    ],
     needsKey: true,
   },
   openai: {
     label: "OpenAI API (your key)",
-    defaultModel: "gpt-5-mini",
-    models: ["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
+    defaultModel: "gpt-5.4-mini",
+    models: [
+      { id: "gpt-5.4-mini", label: "GPT-5.4 mini" },
+      { id: "gpt-5.5", label: "GPT-5.5" },
+      { id: "gpt-5.4", label: "GPT-5.4" },
+      { id: "gpt-5.4-nano", label: "GPT-5.4 nano" },
+    ],
     needsKey: true,
   },
 };
+
+const providerModels = (provider) => PROVIDERS[provider]?.models || [];
+
+const providerModelIds = (provider) => providerModels(provider).map((m) => m.id);
+
+const normalizeModel = (provider, model) =>
+  providerModelIds(provider).includes(model) ? model : PROVIDERS[provider].defaultModel;
 
 const canUseBuiltInClaude = () =>
   typeof window !== "undefined" && Boolean(window.claude);
@@ -1099,7 +1118,7 @@ async function callModel({ provider, model, apiKey, system, userMsg }) {
   if (provider === "openai") {
     let resp;
     try {
-      resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      resp = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1107,15 +1126,13 @@ async function callModel({ provider, model, apiKey, system, userMsg }) {
         },
         body: JSON.stringify({
           model,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userMsg },
-          ],
+          instructions: system,
+          input: userMsg,
         }),
       });
     } catch {
       throw new Error(
-        "Could not reach the OpenAI API. Note: inside claude.ai, browser security rules only allow calls to the Anthropic API — the OpenAI option works when this app is hosted standalone."
+        "Could not reach the OpenAI API. Note: inside claude.ai, browser security rules only allow calls to the Anthropic API; the OpenAI option works when this app is hosted standalone."
       );
     }
     if (!resp.ok) {
@@ -1123,9 +1140,15 @@ async function callModel({ provider, model, apiKey, system, userMsg }) {
       throw new Error(`OpenAI request failed (${resp.status}): ${truncate(errText, 200)}`);
     }
     const data = await resp.json();
+    const outputText =
+      data.output_text ||
+      (data.output || [])
+        .flatMap((item) => item.content || [])
+        .map((part) => part.text || "")
+        .join("");
     return {
-      text: data.choices?.[0]?.message?.content || "",
-      truncated: data.choices?.[0]?.finish_reason === "length",
+      text: outputText,
+      truncated: data.status === "incomplete" || data.incomplete_details?.reason === "max_output_tokens",
     };
   }
 
@@ -1611,7 +1634,7 @@ export default function Codebooker() {
         rows,
         fileSummaries,
         condense,
-        ai: { provider, model: model.trim() || PROVIDERS[provider].defaultModel, apiKey: apiKey.trim() },
+        ai: { provider, model: normalizeModel(provider, model), apiKey: apiKey.trim() },
         onProgress: (msg) => setBusy(msg),
       });
       setRows(refined);
@@ -1761,18 +1784,14 @@ export default function Codebooker() {
             </label>
             <label className="cbk-field">
               <span>Model</span>
-              <input
-                type="text"
+              <select
                 value={model}
-                list="cbk-model-suggestions"
                 onChange={(e) => setModel(e.target.value)}
-                spellCheck={false}
-              />
-              <datalist id="cbk-model-suggestions">
-                {PROVIDERS[provider].models.map((m) => (
-                  <option key={m} value={m} />
+              >
+                {providerModels(provider).map((m) => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
                 ))}
-              </datalist>
+              </select>
             </label>
             {PROVIDERS[provider].needsKey && (
               <label className="cbk-field">
