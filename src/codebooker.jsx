@@ -38,6 +38,22 @@ const stripMarkup = (t) =>
 
 const normalizeId = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 
+const normalizeNameKey = (v) =>
+  String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]+/g, "");
+
+const normalizeLabelKey = (v) =>
+  normalizeId(
+    cleanExtractedText(v)
+      .replace(/_{2,}/g, " ")
+      .replace(/\b(years?|select all that apply)\b/gi, " ")
+  );
+
+const isWeakGeneratedName = (v) => /^(field_\d+|field\d+|q_\d+(?:_[a-z0-9]+)?|q\d+)$/i.test(String(v || "").trim());
+
 const prettify = (id) => {
   let s = String(id || "")
     .replace(/(?<=[a-z0-9])(?=[A-Z])/g, " ")
@@ -88,6 +104,16 @@ const looksBinary = (text) => {
     if ((code >= 0 && code < 9) || (code > 13 && code < 32) || code === 65533) suspicious++;
   }
   return suspicious / sample.length > 0.02;
+};
+
+const cleanExtractedText = (text) =>
+  stripMarkup(String(text || "").replace(/\u00a0/g, " ").replace(/[“”]/g, '"').replace(/[‘’]/g, "'"));
+
+const shortHash = (text) => {
+  let h = 0;
+  const s = normalizeId(text).slice(0, 80);
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
 };
 
 async function extractDocxXmlText(arrayBuffer) {
@@ -467,9 +493,92 @@ function parseQualtricsText(name, text, includeWording) {
 /* ============================================================
    Parser: generic text fallback
    ============================================================ */
-function parseGenericText(name, text) {
-  const paragraphs = text.split("\n").map((l) => l.trim()).filter(Boolean);
-  return paragraphs.slice(0, 20).map((p, i) =>
+const isLikelySectionHeading = (line) => {
+  const words = line.split(/\s+/).filter(Boolean);
+  return words.length <= 5 && !/[?_:]$/.test(line) && !/\b(have|what|how|thinking|please|select|indicate)\b/i.test(line);
+};
+
+const isLikelyQuestionLine = (line) => {
+  if (!line || isLikelySectionHeading(line)) return false;
+  if (/\?$/.test(line)) return true;
+  if (/_{2,}/.test(line)) return true;
+  if (/\b(select all that apply|please indicate|thinking about|in the past|in your life|during the last|how many|how much|what is|have you|do you)\b/i.test(line)) return true;
+  return line.length > 70 && /[a-z]/i.test(line);
+};
+
+const isLikelyChoiceLine = (line) => {
+  if (!line || isLikelyQuestionLine(line)) return false;
+  if (/^[_\d\s-]+$/.test(line)) return true;
+  const words = line.split(/\s+/).filter(Boolean);
+  return words.length <= 12 && line.length <= 120;
+};
+
+const formatGenericChoices = (choices) => {
+  const cleaned = choices.map(cleanExtractedText).filter(Boolean);
+  if (!cleaned.length) return "";
+
+  const numeric = cleaned.filter((c) => /^\d+$/.test(c)).map(Number);
+  const nonNumeric = cleaned.filter((c) => !/^\d+$/.test(c));
+  if (numeric.length >= 2 && nonNumeric.length >= 2) {
+    const nums = [...new Set(numeric)].sort((a, b) => a - b);
+    if (nums.length === nonNumeric.length) {
+      return nums.map((n, i) => `${n}=${nonNumeric[i]}`).join(", ");
+    }
+    if (nums.length === 2 && nonNumeric.length === 2) {
+      return `${nums[0]}=${nonNumeric[0]}, ${nums[1]}=${nonNumeric[1]}`;
+    }
+  }
+  return cleaned.map((c, i) => `${i + 1}=${c}`).join(", ");
+};
+
+function parseGenericQuestionnaire(name, text, includeWording) {
+  const lines = text
+    .split("\n")
+    .map((l) => cleanExtractedText(l))
+    .filter(Boolean);
+  const rows = [];
+  let current = null;
+
+  const flush = () => {
+    if (!current) return;
+    const question = cleanExtractedText(current.question);
+    if (!question || isLikelySectionHeading(question)) {
+      current = null;
+      return;
+    }
+    const values = formatGenericChoices(current.choices);
+    rows.push(
+      mkRow({
+        variable: firstSentence(question) || `Question ${rows.length + 1}`,
+        name: `q_${rows.length + 1}_${shortHash(question)}`,
+        measurement: values ? "Categorical / ordinal" : "Text / numeric",
+        values,
+        description: includeWording ? question : truncate(question, 90),
+        note: "Derived from questionnaire text; variable name is generated because the document did not expose export tags.",
+        role: "survey",
+        origin: name,
+      })
+    );
+    current = null;
+  };
+
+  for (const line of lines) {
+    if (isLikelyQuestionLine(line)) {
+      flush();
+      current = { question: line, choices: [] };
+      continue;
+    }
+    if (!current) continue;
+    if (isLikelyChoiceLine(line)) {
+      current.choices.push(line);
+    } else {
+      current.question = `${current.question} ${line}`.trim();
+    }
+  }
+  flush();
+
+  if (rows.length) return rows;
+  return lines.slice(0, 20).map((p, i) =>
     mkRow({
       variable: firstSentence(p) || `Field ${i + 1}`,
       name: `field_${i + 1}`,
@@ -493,7 +602,7 @@ function parseSurveyText(name, text, includeWording) {
   if (lower.includes("start of block:")) {
     rows = rows.concat(parseQualtricsText(name, cleaned, includeWording));
   }
-  if (!rows.length) rows = parseGenericText(name, cleaned);
+  if (!rows.length) rows = parseGenericQuestionnaire(name, cleaned, includeWording);
   return rows;
 }
 
@@ -519,12 +628,196 @@ function parseTable(originName, headers, records) {
 }
 
 /* ============================================================
+   Parser: SPSS .sav dictionary metadata
+   ============================================================ */
+const savPadded = (n, boundary) => Math.ceil(n / boundary) * boundary;
+
+const decodeSavBytes = (bytes, encoding = "utf-8") => {
+  const label = /windows|1252|latin/i.test(encoding) ? "windows-1252" : "utf-8";
+  try {
+    return new TextDecoder(label, { fatal: false }).decode(bytes).replace(/\0/g, "").trim();
+  } catch {
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/\0/g, "").trim();
+  }
+};
+
+const formatSavValue = (value) => {
+  if (Number.isInteger(value)) return String(value);
+  if (Number.isFinite(value)) return String(Number(value.toFixed(8)));
+  return "";
+};
+
+const savMeasurement = (variable) => {
+  if (variable.type > 0) return "Text";
+  if (!variable.values.length) return "Numeric";
+  const vals = variable.values.map((v) => v.value).sort((a, b) => a - b);
+  if (vals.length === 2 && vals[0] === 0 && vals[1] === 1) return "Binary (0/1)";
+  if (vals.length > 2 && vals.length <= 12) return "Categorical numeric";
+  return "Ordinal / categorical numeric";
+};
+
+function parseSavDictionary(name, arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const dv = new DataView(arrayBuffer);
+  if (bytes.length < 180) throw new Error("File is too small to be a valid SPSS .sav file.");
+
+  const littleEndian = dv.getInt32(176, true) === 2 ? true : dv.getInt32(176, false) === 2 ? false : true;
+  let offset = 176;
+  let dictIndex = 0;
+  let encoding = "utf-8";
+  const variables = [];
+  const byDictIndex = new Map();
+  const pendingValueLabels = [];
+  const longNamePairs = [];
+
+  const readString = (start, length) => decodeSavBytes(bytes.subarray(start, start + length), encoding);
+
+  while (offset + 4 <= bytes.length) {
+    const recordType = dv.getInt32(offset, littleEndian);
+    offset += 4;
+
+    if (recordType === 2) {
+      if (offset + 28 > bytes.length) throw new Error("Unexpected end of SPSS variable record.");
+      const type = dv.getInt32(offset, littleEndian);
+      const hasLabel = dv.getInt32(offset + 4, littleEndian);
+      const missingCount = dv.getInt32(offset + 8, littleEndian);
+      const shortName = readString(offset + 20, 8).toUpperCase();
+      dictIndex++;
+      offset += 28;
+
+      const variable = {
+        dictIndex,
+        shortName,
+        name: shortName,
+        type,
+        label: "",
+        values: [],
+      };
+
+      if (hasLabel) {
+        if (offset + 4 > bytes.length) throw new Error("Unexpected end of SPSS variable label.");
+        const labelLength = dv.getInt32(offset, littleEndian);
+        variable.label = readString(offset + 4, labelLength);
+        offset += 4 + savPadded(labelLength, 4);
+      }
+
+      if (missingCount) offset += Math.abs(missingCount) * 8;
+      if (type !== -1) {
+        variables.push(variable);
+        byDictIndex.set(dictIndex, variable);
+      }
+    } else if (recordType === 3) {
+      const count = dv.getInt32(offset, littleEndian);
+      offset += 4;
+      const values = [];
+      for (let i = 0; i < count; i++) {
+        const value = dv.getFloat64(offset, littleEndian);
+        const labelLength = dv.getUint8(offset + 8);
+        const label = readString(offset + 9, labelLength);
+        values.push({ value, label });
+        offset += 8 + savPadded(labelLength + 1, 8);
+      }
+
+      const nextRecord = dv.getInt32(offset, littleEndian);
+      if (nextRecord !== 4) throw new Error("SPSS value labels were not followed by a variable index record.");
+      offset += 4;
+      const variableCount = dv.getInt32(offset, littleEndian);
+      offset += 4;
+      const indexes = [];
+      for (let i = 0; i < variableCount; i++) {
+        indexes.push(dv.getInt32(offset, littleEndian));
+        offset += 4;
+      }
+      pendingValueLabels.push({ values, indexes });
+    } else if (recordType === 4) {
+      const variableCount = dv.getInt32(offset, littleEndian);
+      offset += 4 + variableCount * 4;
+    } else if (recordType === 6) {
+      const lineCount = dv.getInt32(offset, littleEndian);
+      offset += 4 + lineCount * 80;
+    } else if (recordType === 7) {
+      const subtype = dv.getInt32(offset, littleEndian);
+      const size = dv.getInt32(offset + 4, littleEndian);
+      const count = dv.getInt32(offset + 8, littleEndian);
+      offset += 12;
+      const payload = bytes.subarray(offset, offset + size * count);
+      if (subtype === 13) {
+        longNamePairs.push(...decodeSavBytes(payload, encoding).split("\t"));
+      } else if (subtype === 20) {
+        const declared = decodeSavBytes(payload, encoding);
+        if (declared) encoding = declared;
+      }
+      offset += size * count;
+    } else if (recordType === 999) {
+      break;
+    } else {
+      throw new Error(`Unsupported SPSS dictionary record type ${recordType}.`);
+    }
+  }
+
+  for (const pair of longNamePairs) {
+    const [shortName, longName] = pair.split("=");
+    if (!shortName || !longName) continue;
+    const variable = variables.find((v) => v.shortName === shortName.toUpperCase());
+    if (variable) variable.name = longName.trim();
+  }
+
+  for (const { values, indexes } of pendingValueLabels) {
+    for (const index of indexes) {
+      const variable = byDictIndex.get(index);
+      if (variable) variable.values = values;
+    }
+  }
+
+  const rows = variables.map((v) => {
+    const values = v.values.map((item) => `${formatSavValue(item.value)}=${item.label}`).join(", ");
+    const label = cleanExtractedText(v.label);
+    return mkRow({
+      variable: firstSentence(label) || prettify(v.name),
+      name: v.name,
+      measurement: savMeasurement(v),
+      values,
+      description: label || `SPSS variable \`${v.name}\`.`,
+      note: "Extracted from SPSS .sav dictionary metadata; review computed variables and derived diagnoses.",
+      role: "data",
+      origin: name,
+    });
+  });
+
+  const summary = [
+    `SPSS file: ${name}`,
+    `Variables: ${rows.length}`,
+    ...rows.slice(0, 40).map((r) => `- ${r["Variable name"]} | ${r["Measurement/unit"]} | ${truncate(r.Description, 100)}`),
+  ];
+  if (rows.length > 40) summary.push(`... ${rows.length - 40} more variables`);
+  return { rows, summary: summary.join("\n") };
+}
+
+/* ============================================================
    Merge / reconciliation layer
    ============================================================ */
 function mergeRows(rows) {
+  const hasSavDictionary = rows.some((r) => /SPSS \.sav dictionary/i.test(r.Note || ""));
+  const labelAliases = new Map();
+  for (const r of rows) {
+    const name = normalizeNameKey(r["Variable name"]);
+    const label = normalizeLabelKey(r.Description || r.Variable);
+    if (name && !isWeakGeneratedName(r["Variable name"]) && label.length >= 10 && !labelAliases.has(label)) {
+      labelAliases.set(label, name);
+    }
+  }
+
+  const groupKey = (r) => {
+    const name = normalizeNameKey(r["Variable name"]);
+    const label = normalizeLabelKey(r.Description || r.Variable);
+    if (name && !isWeakGeneratedName(r["Variable name"])) return name;
+    if (label && labelAliases.has(label)) return labelAliases.get(label);
+    return name || (label ? `label_${label}` : "variable");
+  };
+
   const groups = new Map();
   for (const r of rows) {
-    const key = normalizeId(r["Variable name"]);
+    const key = groupKey(r);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
@@ -534,8 +827,14 @@ function mergeRows(rows) {
     const g = groups.get(key);
     const surveyRows = g.filter((r) => r._role === "survey");
     const dataRows = g.filter((r) => r._role === "data");
+    const strongSurveyRows = surveyRows.filter((r) => !isWeakGeneratedName(r["Variable name"]));
+    if (hasSavDictionary && !dataRows.length && surveyRows.length && !strongSurveyRows.length) {
+      continue;
+    }
 
     const name =
+      strongSurveyRows.find((r) => r["Variable name"])?.["Variable name"] ||
+      dataRows.find((r) => r["Variable name"])?.["Variable name"] ||
       surveyRows.find((r) => r["Variable name"])?.["Variable name"] ||
       g.reduce((a, b) => (b["Variable name"].length > (a?.length || 0) ? b["Variable name"] : a), "") ||
       "variable";
@@ -547,8 +846,9 @@ function mergeRows(rows) {
     const description = (descCand || g.find((r) => r.Description.trim()) || { Description: "" }).Description.trim();
 
     const values =
+      strongSurveyRows.find((r) => r.Values.trim())?.Values.trim() ||
+      dataRows.find((r) => r.Values.trim())?.Values.trim() ||
       surveyRows.find((r) => r.Values.trim())?.Values.trim() ||
-      g.find((r) => r.Values.trim())?.Values.trim() ||
       "";
 
     const measurement =
@@ -588,11 +888,11 @@ function mergeRows(rows) {
   // Preserve first-appearance order of variables
   const order = new Map();
   rows.forEach((r, i) => {
-    const k = normalizeId(r["Variable name"]);
+    const k = groupKey(r);
     if (!order.has(k)) order.set(k, i);
   });
   merged.sort(
-    (a, b) => order.get(normalizeId(a["Variable name"])) - order.get(normalizeId(b["Variable name"]))
+    (a, b) => order.get(groupKey(a)) - order.get(groupKey(b))
   );
   return merged;
 }
@@ -667,6 +967,12 @@ async function readUpload(file, roleOverride, includeWording) {
       role = role || "survey";
       rows = parseSurveyText(file.name, text, includeWording);
       summary = truncate(text, 6000);
+    } else if (ext === "sav") {
+      const buf = await readBuffer();
+      const parsed = parseSavDictionary(file.name, buf);
+      role = role || "data";
+      rows = parsed.rows;
+      summary = parsed.summary;
     } else if (ext === "pdf") {
       notes.push(
         `${file.name}: PDF parsing isn't supported in this in-browser version — export the survey as .docx, .txt, or (best) .qsf instead.`
@@ -1385,13 +1691,13 @@ export default function Codebooker() {
           >
             <Upload size={20} style={{ color: "var(--green)" }} />
             <div className="big">Drop files or click to browse</div>
-            <div className="fmt">.qsf · .csv · .xlsx · .docx · .txt · .md · .json</div>
+            <div className="fmt">.qsf · .sav · .csv · .xlsx · .docx · .txt · .md · .json</div>
           </div>
           <input
             ref={inputRef}
             type="file"
             multiple
-            accept=".qsf,.json,.csv,.tsv,.xlsx,.xlsm,.xls,.docx,.txt,.md,.pdf"
+            accept=".qsf,.json,.sav,.csv,.tsv,.xlsx,.xlsm,.xls,.docx,.txt,.md,.pdf"
             style={{ display: "none" }}
             onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
           />
